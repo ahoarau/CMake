@@ -1515,3 +1515,4 @@ add_RunCMake_test(MsvcCharsetDefines
   -DCMake_TEST_CUDA=${CMake_TEST_CUDA}
 )
 set_property(TEST RunCMake.MsvcCharsetDefines APPEND PROPERTY LABELS "CUDA")
+add_RunCMake_test(RunCommand)

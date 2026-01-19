@@ -36,6 +36,7 @@
 #include "cmStdIoConsole.h"
 #include "cmStdIoStream.h"
 #include "cmStdIoTerminal.h"
+#include "cmGeneratorTarget.h"
 #include "cmStringAlgorithms.h"
 #include "cmSystemTools.h"
 #include "cmValue.h"
@@ -72,7 +73,7 @@ cmDocumentationEntry const cmDocumentationUsageNote = {
   "Run 'cmake --help' for more information."
 };
 
-cmDocumentationEntry const cmDocumentationOptions[35] = {
+cmDocumentationEntry const cmDocumentationOptions[37] = {
   { "--preset <preset>,--preset=<preset>", "Specify a configure preset." },
   { "--list-presets[=<type>]", "List available presets." },
   { "--workflow [<options>]", "Run a workflow preset." },
@@ -88,6 +89,7 @@ cmDocumentationEntry const cmDocumentationOptions[35] = {
     "Install a CMake-generated project binary tree. Run \"cmake --install\" "
     "to see compatible options and a quick help." },
   { "--open <dir>", "Open generated project in the associated application." },
+  { "--run <target>", "Run the executable from the build tree." },
   { "-N", "View mode only." },
   { "-P <file>", "Process script mode." },
   { "--find-package", "Legacy pkg-config like mode.  Do not use." },
@@ -579,7 +581,7 @@ int do_build(int ac, char const* const* av)
         if (!matched) {
           std::cerr << "Unknown argument " << arg << std::endl;
         }
-        break;
+        return 1;
       }
     }
 
@@ -863,7 +865,7 @@ int do_install(int ac, char const* const* av)
         if (!matched) {
           std::cerr << "Unknown argument " << arg << std::endl;
         }
-        break;
+        return 1;
       }
     }
   }
@@ -1097,6 +1099,201 @@ int do_open(int ac, char const* const* av)
   return cm.Open(dir, cmake::DryRun::No) ? 0 : 1;
 #endif
 }
+
+int do_run(int ac, char const* const* av)
+{
+#ifdef CMAKE_BOOTSTRAP
+  std::cerr << "This cmake does not support --run\n";
+  return -1;
+#else
+  assert(1 < ac);
+
+  std::string target;
+  std::string dir;
+  std::string config;
+  std::vector<std::string> nativeOptions;
+  bool nativeOptionsPassed = false;
+
+  using CommandArgument =
+    cmCommandLineArgument<bool(std::string const& value)>;
+
+  std::vector<CommandArgument> arguments = {
+    CommandArgument{ "--run", CommandArgument::Values::One,
+                     CommandArgument::setToValue(target) },
+    CommandArgument{ "--build-dir", CommandArgument::Values::One,
+                     CommandArgument::setToValue(dir) },
+    CommandArgument{ "--config", CommandArgument::Values::One,
+                     CommandArgument::setToValue(config) },
+    CommandArgument{ "--", CommandArgument::Values::Zero,
+                     CommandArgument::setToTrue(nativeOptionsPassed) },
+  };
+
+  if (ac >= 2) {
+    std::vector<std::string> inputArgs;
+    inputArgs.reserve(ac - 1);
+    cm::append(inputArgs, av + 1, av + ac);
+
+    decltype(inputArgs.size()) i = 0;
+    for (; i < inputArgs.size() && !nativeOptionsPassed; ++i) {
+      std::string const& arg = inputArgs[i];
+      bool matched = false;
+      bool parsed = false;
+      for (auto const& m : arguments) {
+        matched = m.matches(arg);
+        if (matched) {
+          parsed = m.parse(arg, i, inputArgs);
+          break;
+        }
+      }
+      if (!(matched && parsed)) {
+        dir.clear();
+        if (!matched) {
+          std::cerr << "Unknown argument " << arg << std::endl;
+        }
+        return 1;
+      }
+    }
+
+    if (nativeOptionsPassed) {
+      cm::append(nativeOptions, inputArgs.begin() + i, inputArgs.end());
+    }
+  }
+
+  if (target.empty()) {
+    std::cerr << "No target specified for --run" << std::endl;
+    return 1;
+  }
+
+  if (dir.empty()) {
+    dir = cmSystemTools::GetCurrentWorkingDirectory();
+  }
+
+  dir = cmSystemTools::ToNormalizedPathOnDisk(dir);
+
+  if (!cmSystemTools::FileIsDirectory(dir)) {
+    std::cerr << "Error: " << dir << " is not a directory" << std::endl;
+    return 1;
+  }
+
+  std::string cachePath = cmake::FindCacheFile(dir);
+  if (cachePath.empty()) {
+    std::cerr << "Error: " << dir
+              << " does not contain a CMakeCache.txt file." << std::endl;
+    return 1;
+  }
+
+  cmake cm(cmState::Role::Project);
+  cmSystemTools::SetMessageCallback(
+    [&cm](std::string const& msg, cmMessageMetadata const& md) {
+      cmakemainMessageCallback(msg, md, &cm);
+    });
+  cm.SetProgressCallback([&cm](std::string const& msg, float prog) {
+    cmakemainProgressCallback(msg, prog, &cm);
+  });
+
+  cm.SetHomeOutputDirectory(dir);
+  cm.SetHomeDirectory(dir);
+
+  if (!cm.LoadCache(cachePath)) {
+    std::cerr << "Error: could not load cache" << std::endl;
+    return 1;
+  }
+
+  // Update Home Directory from Cache
+  cmValue homeDir = cm.GetState()->GetCacheEntryValue("CMAKE_HOME_DIRECTORY");
+  if (homeDir) {
+    cm.SetHomeDirectory(*homeDir);
+  }
+
+  // Load the cache
+  cm.AddCMakePaths();
+
+  // Create the global generator
+  cmValue genName = cm.GetState()->GetCacheEntryValue("CMAKE_GENERATOR");
+  if (!genName) {
+    std::cerr << "Error: CMAKE_GENERATOR not found in cache" << std::endl;
+    return 1;
+  }
+
+  std::unique_ptr<cmGlobalGenerator> gg = cm.CreateGlobalGenerator(*genName);
+  if (!gg) {
+    std::cerr << "Error: could not create generator " << *genName << std::endl;
+    return 1;
+  }
+  cm.SetGlobalGenerator(std::move(gg));
+
+  // Set the generator instance, platform, toolset if available
+  if (cmValue instance =
+        cm.GetState()->GetCacheEntryValue("CMAKE_GENERATOR_INSTANCE")) {
+    cm.SetGeneratorInstance(*instance);
+  }
+  if (cmValue platform =
+        cm.GetState()->GetCacheEntryValue("CMAKE_GENERATOR_PLATFORM")) {
+    cm.SetGeneratorPlatform(*platform);
+  }
+  if (cmValue toolset =
+        cm.GetState()->GetCacheEntryValue("CMAKE_GENERATOR_TOOLSET")) {
+    cm.SetGeneratorToolset(*toolset);
+  }
+
+  // Configure the project to populate targets
+  if (cm.Configure() != 0) {
+    std::cerr << "Error: could not configure project" << std::endl;
+    return 1;
+  }
+
+  // Generate the build system
+  if (cm.Generate() != 0) {
+    std::cerr << "Error: could not generate build system" << std::endl;
+    return 1;
+  }
+
+  cmGlobalGenerator* globalGen = cm.GetGlobalGenerator();
+  cmGeneratorTarget* targetPtr = globalGen->FindGeneratorTarget(target);
+
+  if (!targetPtr) {
+    std::cerr << "Error: target '" << target << "' not found" << std::endl;
+    return 1;
+  }
+
+  if (targetPtr->GetType() != cmStateEnums::EXECUTABLE) {
+    std::cerr << "Error: target '" << target << "' is not an executable"
+              << std::endl;
+    return 1;
+  }
+
+  if (globalGen->IsMultiConfig()) {
+    if (config.empty()) {
+      std::cerr << "Error: --config must be specified for multi-configuration "
+                   "generators"
+                << std::endl;
+      return 1;
+    }
+  }
+
+  // If we have CMAKE_BUILD_TYPE in cache, use it for single config generators
+  if (!globalGen->IsMultiConfig() && config.empty()) {
+    cmValue buildType = cm.GetState()->GetCacheEntryValue("CMAKE_BUILD_TYPE");
+    if (buildType) {
+      config = *buildType;
+    }
+  }
+
+  std::string location = targetPtr->GetLocation(config);
+
+  // Prepare command line
+  std::vector<std::string> command;
+  command.push_back(location);
+  command.insert(command.end(), nativeOptions.begin(), nativeOptions.end());
+
+  int retVal = 0;
+  if (!cmSystemTools::RunSingleCommand(command, nullptr, nullptr, &retVal,
+                                       dir.c_str())) {
+    return 1;
+  }
+  return retVal;
+#endif
+}
 } // namespace
 
 int main(int ac, char const* const* av)
@@ -1122,6 +1319,9 @@ int main(int ac, char const* const* av)
     }
     if (strcmp(av[1], "--workflow") == 0) {
       return do_workflow(ac, av);
+    }
+    if (strcmp(av[1], "--run") == 0) {
+      return do_run(ac, av);
     }
     if (strcmp(av[1], "-E") == 0) {
       return do_command(ac, av, std::move(console));
