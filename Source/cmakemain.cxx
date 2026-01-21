@@ -95,7 +95,7 @@ cmDocumentationEntry const cmDocumentationOptions[37] = {
     "Install a CMake-generated project binary tree. Run \"cmake --install\" "
     "to see compatible options and a quick help." },
   { "--open <dir>", "Open generated project in the associated application." },
-  { "--run <target>", "Run the executable from the build tree." },
+  { "--run-target <target>", "Run the executable from the build tree." },
   { "--list-targets", "List executable targets in the build tree." },
   { "-N", "View mode only." },
   { "-P <file>", "Process script mode." },
@@ -1116,7 +1116,8 @@ int do_list_targets(int ac, char const* const* av)
   assert(1 < ac);
 
   std::string dir;
-  bool showLocation = false;
+  bool fullPath = false;
+  bool absolute = false;
 
   using CommandArgument =
     cmCommandLineArgument<bool(std::string const& value)>;
@@ -1126,8 +1127,10 @@ int do_list_targets(int ac, char const* const* av)
                      [](std::string const&) -> bool { return true; } },
     CommandArgument{ "--build-dir", CommandArgument::Values::One,
                      CommandArgument::setToValue(dir) },
-    CommandArgument{ "--show-location", CommandArgument::Values::Zero,
-                     CommandArgument::setToTrue(showLocation) },
+    CommandArgument{ "--full-path", CommandArgument::Values::Zero,
+                     CommandArgument::setToTrue(fullPath) },
+    CommandArgument{ "--absolute", CommandArgument::Values::Zero,
+                     CommandArgument::setToTrue(absolute) },
   };
 
   std::vector<std::string> inputArgs;
@@ -1268,10 +1271,15 @@ int do_list_targets(int ac, char const* const* av)
          if (reader.parse(tfin, targetObj, false)) {
             if (targetObj["type"].asString() == "EXECUTABLE") {
                std::string path;
-               if (showLocation) {
+               if (fullPath || absolute) {
                    const Json::Value& artifacts = targetObj["artifacts"];
                    if (artifacts.isArray() && !artifacts.empty()) {
                        path = artifacts[0]["path"].asString();
+                       path = cmSystemTools::CollapseFullPath(path, dir);
+                       if (!absolute) {
+                           std::string cwd = cmSystemTools::GetCurrentWorkingDirectory();
+                           path = cmSystemTools::RelativePath(cwd, path);
+                       }
                    }
                }
                executables.push_back({targetObj["name"].asString(), path});
@@ -1295,7 +1303,7 @@ int do_list_targets(int ac, char const* const* av)
   executables.erase(last, executables.end());
 
   size_t maxNameLen = 0;
-  if (showLocation) {
+  if (fullPath || absolute) {
       for (const auto& exe : executables) {
           if (exe.Name.length() > maxNameLen) {
               maxNameLen = exe.Name.length();
@@ -1304,10 +1312,11 @@ int do_list_targets(int ac, char const* const* av)
   }
 
   for (const auto& exe : executables) {
-    if (showLocation && !exe.Path.empty()) {
-        std::cout << std::left << std::setw(maxNameLen + 4) << exe.Name << exe.Path << std::endl;
+    if ((fullPath || absolute) && !exe.Path.empty()) {
+      std::cout << "Target: " << std::left << std::setw(maxNameLen + 4)
+                << exe.Name << "Path: " << exe.Path << std::endl;
     } else {
-        std::cout << exe.Name << std::endl;
+      std::cout << exe.Name << std::endl;
     }
   }
 
@@ -1318,7 +1327,7 @@ int do_list_targets(int ac, char const* const* av)
 int do_run(int ac, char const* const* av)
 {
 #ifdef CMAKE_BOOTSTRAP
-  std::cerr << "This cmake does not support --run\n";
+  std::cerr << "This cmake does not support --run-target\n";
   return -1;
 #else
   assert(1 < ac);
@@ -1333,7 +1342,7 @@ int do_run(int ac, char const* const* av)
     cmCommandLineArgument<bool(std::string const& value)>;
 
   std::vector<CommandArgument> arguments = {
-    CommandArgument{ "--run", CommandArgument::Values::One,
+    CommandArgument{ "--run-target", CommandArgument::Values::One,
                      CommandArgument::setToValue(target) },
     CommandArgument{ "--build-dir", CommandArgument::Values::One,
                      CommandArgument::setToValue(dir) },
@@ -1375,7 +1384,7 @@ int do_run(int ac, char const* const* av)
   }
 
   if (target.empty()) {
-    std::cerr << "No target specified for --run" << std::endl;
+    std::cerr << "No target specified for --run-target" << std::endl;
     return 1;
   }
 
@@ -1528,7 +1537,7 @@ int do_run(int ac, char const* const* av)
   if (location.empty()) {
     std::cerr << "Error: Executable for target '" << target
               << "' not found in build directory." << std::endl;
-    std::cerr << "Note: --run works best with standard output locations. "
+    std::cerr << "Note: --run-target works best with standard output locations. "
                  "If your target uses a custom OUTPUT_NAME or directory, "
                  "it might not be found."
               << std::endl;
@@ -1574,7 +1583,7 @@ int main(int ac, char const* const* av)
     if (strcmp(av[1], "--workflow") == 0) {
       return do_workflow(ac, av);
     }
-    if (strcmp(av[1], "--run") == 0) {
+    if (strcmp(av[1], "--run-target") == 0) {
       return do_run(ac, av);
     }
     if (strcmp(av[1], "--list-targets") == 0) {
