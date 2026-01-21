@@ -10,6 +10,7 @@
 #include <cstring>
 #include <functional>
 #include <iostream>
+#include <iomanip>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -19,6 +20,11 @@
 #include <cmext/algorithm>
 
 #include <cm3p/uv.h>
+
+#include <cm3p/json/value.h>
+#include <cm3p/json/reader.h>
+#include "cmsys/Directory.hxx"
+#include "cmsys/FStream.hxx"
 
 #include "cmBuildArgs.h"
 #include "cmBuildOptions.h"
@@ -90,6 +96,7 @@ cmDocumentationEntry const cmDocumentationOptions[37] = {
     "to see compatible options and a quick help." },
   { "--open <dir>", "Open generated project in the associated application." },
   { "--run <target>", "Run the executable from the build tree." },
+  { "--list-targets", "List executable targets in the build tree." },
   { "-N", "View mode only." },
   { "-P <file>", "Process script mode." },
   { "--find-package", "Legacy pkg-config like mode.  Do not use." },
@@ -1100,6 +1107,214 @@ int do_open(int ac, char const* const* av)
 #endif
 }
 
+int do_list_targets(int ac, char const* const* av)
+{
+#ifdef CMAKE_BOOTSTRAP
+  std::cerr << "This cmake does not support --list-targets\n";
+  return -1;
+#else
+  assert(1 < ac);
+
+  std::string dir;
+  bool showLocation = false;
+
+  using CommandArgument =
+    cmCommandLineArgument<bool(std::string const& value)>;
+
+  std::vector<CommandArgument> arguments = {
+    CommandArgument{ "--list-targets", CommandArgument::Values::Zero,
+                     [](std::string const&) -> bool { return true; } },
+    CommandArgument{ "--build-dir", CommandArgument::Values::One,
+                     CommandArgument::setToValue(dir) },
+    CommandArgument{ "--show-location", CommandArgument::Values::Zero,
+                     CommandArgument::setToTrue(showLocation) },
+  };
+
+  std::vector<std::string> inputArgs;
+  inputArgs.reserve(ac - 1);
+  cm::append(inputArgs, av + 1, av + ac);
+
+  for (decltype(inputArgs.size()) i = 0; i < inputArgs.size(); ++i) {
+    std::string const& arg = inputArgs[i];
+    bool matched = false;
+    bool parsed = false;
+    for (auto const& m : arguments) {
+      matched = m.matches(arg);
+      if (matched) {
+        parsed = m.parse(arg, i, inputArgs);
+        break;
+      }
+    }
+    if (!(matched && parsed)) {
+      if (!matched) {
+        std::cerr << "Unknown argument " << arg << std::endl;
+      }
+      return 1;
+    }
+  }
+
+  if (dir.empty()) {
+    dir = cmSystemTools::GetCurrentWorkingDirectory();
+  }
+  dir = cmSystemTools::ToNormalizedPathOnDisk(dir);
+
+  std::string apiReplyDir = dir + "/.cmake/api/v1/reply";
+  if (!cmSystemTools::FileIsDirectory(apiReplyDir)) {
+    std::cerr << "Error: .cmake/api/v1/reply directory not found in " << dir << std::endl;
+    std::cerr << "Ensure CMake has generated the File API reply (codemodel-v2)." << std::endl;
+    return 1;
+  }
+
+  cmsys::Directory d;
+  d.Load(apiReplyDir);
+  std::string latestIndex;
+  for (unsigned long i = 0; i < d.GetNumberOfFiles(); ++i) {
+    const char* fname = d.GetFile(i);
+    if (cmHasLiteralPrefix(fname, "index-") && cmHasLiteralSuffix(fname, ".json")) {
+       if (latestIndex.empty() || strcmp(fname, latestIndex.c_str()) > 0) {
+         latestIndex = fname;
+       }
+    }
+  }
+
+  if (latestIndex.empty()) {
+    std::cerr << "Error: No index file found in " << apiReplyDir << std::endl;
+    return 1;
+  }
+
+  std::string indexFilePath = apiReplyDir + "/" + latestIndex;
+  cmsys::ifstream fin(indexFilePath.c_str());
+  if (!fin) {
+     std::cerr << "Error: Could not read " << indexFilePath << std::endl;
+     return 1;
+  }
+
+  Json::Value index;
+  Json::Reader reader;
+  if (!reader.parse(fin, index, false)) {
+    std::cerr << "Error: Failed to parse " << indexFilePath << std::endl;
+    return 1;
+  }
+
+  std::string codemodelFile;
+  const Json::Value& objects = index["objects"];
+  if (objects.isArray()) {
+     for (const auto& obj : objects) {
+        if (obj.isObject() && obj["kind"].asString() == "codemodel" && obj["version"]["major"].asInt() == 2) {
+           codemodelFile = obj["jsonFile"].asString();
+           break;
+        }
+     }
+  }
+
+  if (codemodelFile.empty()) {
+    const Json::Value& reply = index["reply"];
+    if (reply.isObject()) {
+       for (auto const& key : reply.getMemberNames()) {
+           const Json::Value& obj = reply[key];
+           if (obj.isObject() && obj.isMember("jsonFile")) {
+              codemodelFile = obj["jsonFile"].asString();
+              break;
+           }
+         }
+       
+       if (codemodelFile.empty()) {
+          for (auto const& key : reply.getMemberNames()) {
+             const Json::Value& obj = reply[key];
+             if (obj.isObject() && obj["kind"].asString() == "codemodel" && obj["version"]["major"].asInt() == 2) {
+                 codemodelFile = obj["jsonFile"].asString();
+                 break;
+             }
+          }
+       }
+    }
+  }
+
+  if (codemodelFile.empty()) {
+    std::cerr << "Error: Could not find codemodel-v2 in " << indexFilePath << std::endl;
+    return 1;
+  }
+
+  std::string codemodelPath = apiReplyDir + "/" + codemodelFile;
+  fin.close();
+  fin.open(codemodelPath.c_str());
+  if (!fin) {
+     std::cerr << "Error: Could not read " << codemodelPath << std::endl;
+     return 1;
+  }
+  
+  Json::Value codemodel;
+  if (!reader.parse(fin, codemodel, false)) {
+    std::cerr << "Error: Failed to parse " << codemodelPath << std::endl;
+    return 1;
+  }
+
+  struct TargetInfo {
+      std::string Name;
+      std::string Path;
+  };
+  std::vector<TargetInfo> executables;
+
+  const Json::Value& configurations = codemodel["configurations"];
+  for (const auto& config : configurations) {
+    const Json::Value& targets = config["targets"];
+    for (const auto& target : targets) {
+      std::string targetJsonFile = target["jsonFile"].asString();
+      std::string targetPath = apiReplyDir + "/" + targetJsonFile;
+      
+      cmsys::ifstream tfin(targetPath.c_str());
+      if (tfin) {
+         Json::Value targetObj;
+         if (reader.parse(tfin, targetObj, false)) {
+            if (targetObj["type"].asString() == "EXECUTABLE") {
+               std::string path;
+               if (showLocation) {
+                   const Json::Value& artifacts = targetObj["artifacts"];
+                   if (artifacts.isArray() && !artifacts.empty()) {
+                       path = artifacts[0]["path"].asString();
+                   }
+               }
+               executables.push_back({targetObj["name"].asString(), path});
+            }
+         }
+      }
+    }
+  }
+  
+  std::sort(executables.begin(), executables.end(),
+            [](TargetInfo const& l, TargetInfo const& r) {
+                if (l.Name != r.Name) {
+                    return l.Name < r.Name;
+                }
+                return l.Path < r.Path;
+            });
+  auto last = std::unique(executables.begin(), executables.end(),
+             [](TargetInfo const& l, TargetInfo const& r) {
+                 return l.Name == r.Name && l.Path == r.Path;
+             });
+  executables.erase(last, executables.end());
+
+  size_t maxNameLen = 0;
+  if (showLocation) {
+      for (const auto& exe : executables) {
+          if (exe.Name.length() > maxNameLen) {
+              maxNameLen = exe.Name.length();
+          }
+      }
+  }
+
+  for (const auto& exe : executables) {
+    if (showLocation && !exe.Path.empty()) {
+        std::cout << std::left << std::setw(maxNameLen + 4) << exe.Name << exe.Path << std::endl;
+    } else {
+        std::cout << exe.Name << std::endl;
+    }
+  }
+
+  return 0;
+#endif
+}
+
 int do_run(int ac, char const* const* av)
 {
 #ifdef CMAKE_BOOTSTRAP
@@ -1237,30 +1452,30 @@ int do_run(int ac, char const* const* av)
   }
 
   // Configure the project to populate targets
-  if (cm.Configure() != 0) {
-    std::cerr << "Error: could not configure project" << std::endl;
-    return 1;
-  }
+  // if (cm.Configure() != 0) {
+  //   std::cerr << "Error: could not configure project" << std::endl;
+  //   return 1;
+  // }
 
-  // Generate the build system
-  if (cm.Generate() != 0) {
-    std::cerr << "Error: could not generate build system" << std::endl;
-    return 1;
-  }
+  // // Generate the build system
+  // if (cm.Generate() != 0) {
+  //   std::cerr << "Error: could not generate build system" << std::endl;
+  //   return 1;
+  // }
 
   cmGlobalGenerator* globalGen = cm.GetGlobalGenerator();
-  cmGeneratorTarget* targetPtr = globalGen->FindGeneratorTarget(target);
+  // cmGeneratorTarget* targetPtr = globalGen->FindGeneratorTarget(target);
 
-  if (!targetPtr) {
-    std::cerr << "Error: target '" << target << "' not found" << std::endl;
-    return 1;
-  }
+  // if (!targetPtr) {
+  //   std::cerr << "Error: target '" << target << "' not found" << std::endl;
+  //   return 1;
+  // }
 
-  if (targetPtr->GetType() != cmStateEnums::EXECUTABLE) {
-    std::cerr << "Error: target '" << target << "' is not an executable"
-              << std::endl;
-    return 1;
-  }
+  // if (targetPtr->GetType() != cmStateEnums::EXECUTABLE) {
+  //   std::cerr << "Error: target '" << target << "' is not an executable"
+  //             << std::endl;
+  //   return 1;
+  // }
 
   if (globalGen->IsMultiConfig()) {
     if (config.empty()) {
@@ -1279,7 +1494,46 @@ int do_run(int ac, char const* const* av)
     }
   }
 
-  std::string location = targetPtr->GetLocation(config);
+  // std::string location = targetPtr->GetLocation(config);
+  std::string location;
+  {
+    std::string exeExt;
+#if defined(_WIN32) || defined(__CYGWIN__)
+    exeExt = ".exe";
+#endif
+    std::string targetExe = target + exeExt;
+    std::vector<std::string> attempts;
+    if (globalGen->IsMultiConfig()) {
+      attempts.push_back(config + "/" + targetExe);
+      attempts.push_back(config + "/bin/" + targetExe);
+      attempts.push_back(config + "/App/" + targetExe); // Some bundles
+    } else {
+      attempts.push_back(targetExe);
+      attempts.push_back("bin/" + targetExe);
+      if (!config.empty()) {
+        attempts.push_back(config + "/" + targetExe);
+      }
+    }
+
+    for (std::string const& attempt : attempts) {
+      std::string fullPath = dir + "/" + attempt;
+      if (cmSystemTools::FileExists(fullPath) &&
+          !cmSystemTools::FileIsDirectory(fullPath)) {
+        location = fullPath;
+        break;
+      }
+    }
+  }
+
+  if (location.empty()) {
+    std::cerr << "Error: Executable for target '" << target
+              << "' not found in build directory." << std::endl;
+    std::cerr << "Note: --run works best with standard output locations. "
+                 "If your target uses a custom OUTPUT_NAME or directory, "
+                 "it might not be found."
+              << std::endl;
+    return 1;
+  }
 
   // Prepare command line
   std::vector<std::string> command;
@@ -1322,6 +1576,9 @@ int main(int ac, char const* const* av)
     }
     if (strcmp(av[1], "--run") == 0) {
       return do_run(ac, av);
+    }
+    if (strcmp(av[1], "--list-targets") == 0) {
+      return do_list_targets(ac, av);
     }
     if (strcmp(av[1], "-E") == 0) {
       return do_command(ac, av, std::move(console));
